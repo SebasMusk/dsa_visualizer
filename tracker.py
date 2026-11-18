@@ -57,6 +57,9 @@ class StateTracker:
         self._watched: Dict[str, Any] = {}
         self._highlights: Dict[str, Any] = {}
         self._metadata: Dict[str, Any] = {}
+        # How each watched value is copied into a snapshot (instrumentor swaps in
+        # a size-bounded copy so huge structures don't make every step expensive).
+        self.copy_fn: Callable[[Any], Any] = copy.deepcopy
 
     # ── Properties ────────────────────────────────────────────────────────────
 
@@ -133,7 +136,7 @@ class StateTracker:
         snap = Snapshot(
             step=self._step,
             label=label,
-            variables=copy.deepcopy(self._watched),
+            variables={k: self.copy_fn(v) for k, v in self._watched.items()},
             highlights=copy.deepcopy(self._highlights),
             metadata=copy.deepcopy(self._metadata),
         )

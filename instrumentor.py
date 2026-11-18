@@ -89,6 +89,17 @@ _SAFE_MODULES: Dict[str, Any] = {
 
 _MAX_OUTPUT_CHARS = 1_000_000
 
+# Highest recursion limit user code may request via sys.setrecursionlimit().
+_MAX_RECURSION_LIMIT = 200_000
+# Snapshots keep at most this many items per container (the renderer never shows
+# more than 50 cells / 20 graph nodes) and this much nesting. Real sizes go to
+# metadata['__sizes__'].
+_SNAP_MAX_ITEMS = 300
+_SNAP_MAX_DEPTH = 20
+# Stack sizes tried (in order) for the thread that runs user code. Deep Python
+# recursion needs a big C stack; the first size the OS accepts is used.
+_THREAD_STACK_SIZES = (256 * 1024 * 1024, 128 * 1024 * 1024, 64 * 1024 * 1024)
+
 
 class _CappedStringIO(io.StringIO):
     """StringIO that stops accepting text after _MAX_OUTPUT_CHARS."""
@@ -128,8 +139,10 @@ class FakeSys:
         self.float_info = sys.float_info
         self.argv: List[str] = ['main.py']
 
-    def setrecursionlimit(self, _limit: int) -> None:   # no-op
-        pass
+    def setrecursionlimit(self, limit: int) -> None:
+        """Real limit, capped at _MAX_RECURSION_LIMIT. The instrumentor restores
+        the original limit when the run ends (success, error or timeout)."""
+        sys.setrecursionlimit(min(limit, _MAX_RECURSION_LIMIT))
 
     def getrecursionlimit(self) -> int:
         return sys.getrecursionlimit()
@@ -205,11 +218,13 @@ def _normalise(value: Any) -> Any:
     """Convert set/deque → list so the visualizer can render them."""
     if isinstance(value, (set, frozenset)):
         try:
+            if len(value) > _SNAP_MAX_ITEMS:
+                return _heapq.nsmallest(_SNAP_MAX_ITEMS, value)
             return sorted(value)
         except TypeError:
-            return list(value)
+            return list(_itertools.islice(value, _SNAP_MAX_ITEMS))
     if isinstance(value, deque):
-        return list(value)
+        return list(_itertools.islice(value, _SNAP_MAX_ITEMS))
     return value
 
 
@@ -220,6 +235,47 @@ def _is_weighted_adj(rows: Any) -> bool:
         return False
     items = [e for r in rows for e in r]
     return bool(items) and all(isinstance(e, tuple) and len(e) == 2 for e in items)
+
+
+_ATOMIC = (int, float, complex, bool, str, bytes, type(None))
+
+
+def _bounded_copy(obj: Any, depth: int = 0) -> Any:
+    """Deep copy that keeps only the first _SNAP_MAX_ITEMS items of each container."""
+    if isinstance(obj, _ATOMIC):
+        return obj
+    if depth >= _SNAP_MAX_DEPTH:
+        return '…'
+    L, d = _SNAP_MAX_ITEMS, depth + 1
+    if isinstance(obj, list):
+        return [_bounded_copy(x, d) for x in obj[:L]]
+    if isinstance(obj, tuple):
+        return tuple(_bounded_copy(x, d) for x in obj[:L])
+    if isinstance(obj, dict):
+        return {k: _bounded_copy(v, d) for k, v in _itertools.islice(obj.items(), L)}
+    if isinstance(obj, (set, frozenset)):
+        return type(obj)(_itertools.islice(obj, L))
+    if isinstance(obj, deque):
+        return deque(_bounded_copy(x, d) for x in _itertools.islice(obj, L))
+    try:
+        return deepcopy(obj)
+    except Exception:
+        return repr(obj)
+
+
+def _view(value: Any) -> Any:
+    """Cheap top-level truncation, comparable with a _bounded_copy of the value."""
+    if isinstance(value, (list, tuple)) and len(value) > _SNAP_MAX_ITEMS:
+        return value[:_SNAP_MAX_ITEMS]
+    if isinstance(value, dict) and len(value) > _SNAP_MAX_ITEMS:
+        return dict(_itertools.islice(value.items(), _SNAP_MAX_ITEMS))
+    return value
+
+
+def _big_size(value: Any) -> Optional[int]:
+    if isinstance(value, (list, tuple, dict, set, frozenset, deque)) and len(value) > _SNAP_MAX_ITEMS:
+        return len(value)
+    return None
 
 
 def _kind(value: Any) -> Optional[str]:
@@ -271,6 +327,9 @@ class CodeInstrumentor:
         #   instr.truncated     — True if max_snapshots was reached
         #   instr.error_info    — {'type', 'msg', 'line'} or None
         #   instr.exec_time_ms  — wall time of an untraced run (None if n/a)
+        #   instr.stack_size_used — thread stack used for user code (256/128/64 MB)
+    Deep recursion: sys.setrecursionlimit(n) inside user code applies
+    min(n, 200000) for that run only; the original limit is always restored.
     """
 
     _FILENAME = "<user_code>"
@@ -291,6 +350,7 @@ class CodeInstrumentor:
         self._src_lines: List[str] = []
         self._prev: Dict[str, Any] = {}
         self._kinds: Dict[str, str] = {}
+        self._sizes: Dict[str, int] = {}   # real len() of containers bigger than the snapshot cap
         self._owner: Dict[str, int] = {}   # var name → id() of the frame that last set it
         self._deadline = 0.0
         self._last_line = 0
@@ -304,6 +364,7 @@ class CodeInstrumentor:
         self.truncated: bool = False
         self.error_info: Optional[Dict[str, Any]] = None
         self.exec_time_ms: Optional[float] = None
+        self.stack_size_used: int = 0   # bytes of thread stack (0 = OS default)
 
     # ── sys.settrace hooks ────────────────────────────────────────────────────
 
@@ -356,6 +417,7 @@ class CodeInstrumentor:
         for k in owned:
             del self._owner[k]
             self._kinds.pop(k, None)
+            self._sizes.pop(k, None)
             self._prev.pop(k, None)
         if owned:
             self.tracker.unwatch(*owned)
@@ -376,6 +438,7 @@ class CodeInstrumentor:
         for k in gone:
             del self._owner[k]
             self._kinds.pop(k, None)
+            self._sizes.pop(k, None)
         for k in current:
             self._owner[k] = fid
         if gone:
@@ -388,13 +451,19 @@ class CodeInstrumentor:
             kind = _kind(v)
             if kind is not None:
                 self._kinds[k] = kind
+            size = _big_size(v)
+            if size is None:
+                self._sizes.pop(k, None)
+            else:
+                self._sizes[k] = size
 
         self.tracker.watch(**current)
         src = self._src(lineno)
         self.tracker.set_meta(line=lineno, source=src, __kinds__=dict(self._kinds),
-                              out_len=out_len)
-        self.tracker.snapshot(f"L{lineno}: {src}")
-        self._prev = {k: deepcopy(v) for k, v in current.items()}
+                              __sizes__=dict(self._sizes), out_len=out_len)
+        snap = self.tracker.snapshot(f"L{lineno}: {src}")
+        # Snapshot copies are never mutated: reuse them instead of copying again.
+        self._prev = {k: snap.variables[k] for k in current}
         self._snap_out_len = out_len
 
     def _src(self, lineno: Optional[int]) -> str:
@@ -411,16 +480,19 @@ class CodeInstrumentor:
         if raw:
             self.tracker.replace_watched(**{k: _normalise(v) for k, v in raw.items()})
             kinds = {k: kd for k, v in raw.items() if (kd := _kind(v)) is not None}
+            sizes = {k: sz for k, v in raw.items() if (sz := _big_size(v)) is not None}
         elif self.tracker.snapshots:
             # Everything lived inside main()/solve(): keep the last state seen.
             last = self.tracker.snapshots[-1]
             self.tracker.replace_watched(**last.variables)
             kinds = dict(last.metadata.get('__kinds__', {}))
+            sizes = dict(last.metadata.get('__sizes__', {}))
         else:
-            kinds = {}
+            kinds, sizes = {}, {}
 
         line = (error or {}).get('line') or self._last_line or None
         meta: Dict[str, Any] = dict(line=line, source=self._src(line), __kinds__=kinds,
+                                    __sizes__=sizes,
                                     out_len=len(output), final=True, error=bool(error))
         if error:
             meta['error_msg'] = f"{error['type']}: {error['msg']}"
@@ -432,7 +504,7 @@ class CodeInstrumentor:
             return True
         for k, v in current.items():
             try:
-                if v != self._prev.get(k):
+                if _view(v) != self._prev.get(k):
                     return True
             except Exception:
                 return True
@@ -441,9 +513,42 @@ class CodeInstrumentor:
     # ── Execution ─────────────────────────────────────────────────────────────
 
     def _user_line(self, exc: BaseException) -> Optional[int]:
-        frames = [fs for fs in traceback.extract_tb(exc.__traceback__)
-                  if fs.filename == self._FILENAME]
-        return frames[-1].lineno if frames else None
+        """Line of the innermost user-code frame in the traceback.
+
+        For RecursionError, if the two innermost user frames run the same
+        function, report the caller's line: that is the recursive call.
+        """
+        last = prev = None   # (code, lineno) of the innermost / 2nd innermost
+        tb = exc.__traceback__
+        while tb is not None:   # manual walk: extract_tb is slow on 200k frames
+            code = tb.tb_frame.f_code
+            if code.co_filename == self._FILENAME:
+                prev, last = last, (code, tb.tb_lineno)
+            tb = tb.tb_next
+        if last is None:
+            return None
+        if isinstance(exc, RecursionError) and prev is not None and prev[0] is last[0]:
+            return prev[1]
+        return last[1]
+
+    @staticmethod
+    def _start_big_stack_thread(target: Callable[[], None]) -> tuple:
+        """Start `target` in a daemon thread with the largest stack the OS accepts."""
+        old = threading.stack_size()
+        used = 0
+        for size in _THREAD_STACK_SIZES:
+            try:
+                threading.stack_size(size)
+                used = size
+                break
+            except (ValueError, RuntimeError):
+                continue
+        try:
+            thread = threading.Thread(target=target, daemon=True)
+            thread.start()
+        finally:
+            threading.stack_size(old)   # never leak the setting to other threads
+        return thread, used
 
     def _exec_once(self, compiled, stdin_text: str, traced: bool) -> Dict[str, Any]:
         """Run compiled code once in a fresh sandbox, in a daemon thread."""
@@ -454,6 +559,8 @@ class CodeInstrumentor:
         if traced:
             self._out = fake_sys.stdout
             self._globals = sandbox_globals
+
+        orig_limit = sys.getrecursionlimit()
 
         def _execute() -> None:
             t0 = time.perf_counter()
@@ -471,6 +578,14 @@ class CodeInstrumentor:
                            "(¿bucle infinito o input muy grande?)",
                     'line': self._last_line or None,
                 }
+            except RecursionError as exc:
+                limit = sys.getrecursionlimit()
+                result['error'] = {
+                    'type': 'RecursionError',
+                    'msg': f"Recursión demasiado profunda (límite {limit}). Si tu código "
+                           "usa recursión, llama a sys.setrecursionlimit(...)",
+                    'line': self._user_line(exc),
+                }
             except BaseException as exc:  # noqa: BLE001 — report everything
                 result['error'] = {
                     'type': type(exc).__name__,
@@ -480,12 +595,13 @@ class CodeInstrumentor:
             finally:
                 if traced:
                     sys.settrace(None)
+                sys.setrecursionlimit(orig_limit)
                 result['elapsed'] = (time.perf_counter() - t0) * 1000
                 result['done'] = True
 
-        thread = threading.Thread(target=_execute, daemon=True)
-        thread.start()
+        thread, self.stack_size_used = self._start_big_stack_thread(_execute)
         thread.join(timeout=self.timeout + 1)
+        sys.setrecursionlimit(orig_limit)   # also if the thread is still stuck
 
         if not result['done']:
             self._stopped = True   # runaway thread: stop recording from it
@@ -509,7 +625,9 @@ class CodeInstrumentor:
         self._src_lines = code.splitlines()
         self._prev      = {}
         self._kinds     = {}
+        self._sizes     = {}
         self._owner     = {}
+        self.tracker.copy_fn = _bounded_copy
         self._last_line = 0
         self._snap_out_len = 0
         self._out = None

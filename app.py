@@ -195,10 +195,13 @@ if st.session_state["viz_ran"]:
 
     if snaps:
         st.divider()
-        st.components.v1.html(
+        # st.iframe embeds an HTML string via srcdoc (replaces the deprecated
+        # st.components.v1.html). The page is 840px inside an 860px frame with
+        # body{overflow:hidden}, so no scrollbar appears.
+        st.iframe(
             build_viz_html(snaps, source_lines=source.splitlines(),
                            output=st.session_state["viz_output"]),
-            height=VIZ_IFRAME_HEIGHT, scrolling=False,
+            height=VIZ_IFRAME_HEIGHT,
         )
     elif not err:
         st.info("No se capturaron pasos: el código no asignó variables observables.")

@@ -719,7 +719,8 @@ const ARRAYISH=new Set(['array','queue','stack','tuples','chars']);
 const isNodeRef=x=>x===null||isInt(x);
 
 // One panel per structure; left/right (or l/r) arrays merge into one tree panel.
-function buildPanels(vars,kinds){
+function buildPanels(vars,kinds,sizes){
+  sizes=sizes||{};
   const panels=[],used=new Set();
   for(const[a,b]of[['left','right'],['l','r']]){
     const A=vars[a],B=vars[b];
@@ -739,7 +740,8 @@ function buildPanels(vars,kinds){
     let v=val;
     if(type==='chars')v=Array.from(val);
     else if(type==='bintree')v=treeFromDict(val);
-    panels.push({name,title:name,type,val:v,
+    const title=sizes[name]?name+' · '+sizes[name]+' elementos (se ven los primeros '+(Array.isArray(val)?val.length:Object.keys(val).length)+')':name;
+    panels.push({name,title,type,val:v,
                  weighted:type==='graph'&&isWeightedAdj(name,val,kinds)});
   }
   return panels;
@@ -775,7 +777,7 @@ function renderMeta(variables,metadata,prevVars){
   const me=document.getElementById('metaextra');
   me.innerHTML='';
   for(const[k,v]of Object.entries(metadata)){
-    if(k==='line'||k==='source'||k==='__kinds__'||k==='out_len'||k==='final'||k==='error'||k==='error_msg')continue;
+    if(k==='line'||k==='source'||k==='__kinds__'||k==='__sizes__'||k==='out_len'||k==='final'||k==='error'||k==='error_msg')continue;
     const d=document.createElement('div');
     d.className='mr';
     const sv=JSON.stringify(v);
@@ -828,6 +830,7 @@ function toggleCode(){
   const hidden=left.style.display==='none';
   if(hidden){left.style.display='flex';btn.textContent='⟨ Ocultar código';}
   else{left.style.display='none';btn.textContent='⟩ Ver código';}
+  renderStep(cur);   // panel width changed: re-layout the SVGs
 }
 
 // ── Viz panel ─────────────────────────────────────────────────────────────────
@@ -1078,7 +1081,7 @@ function renderStep(idx){
   const s=injectPathHighlights(Object.assign({},base,{
     highlights:mergeHL(base.highlights,autoHighlights(base,prevSnap)),
   }));
-  const panels=buildPanels(s.variables,s.metadata.__kinds__||{});
+  const panels=buildPanels(s.variables,s.metadata.__kinds__||{},s.metadata.__sizes__);
   renderBadge(s);
   renderOutput(idx,s);
   highlightLine(s.metadata.line||0,HOTSPOTS);
