@@ -342,6 +342,38 @@ def _index_vars(code: str) -> tuple:
     return all_names, {k: sorted(v) for k, v in per.items()}
 
 
+_CALL_TEXT_MAX = 40
+
+
+def _clip(text: str, n: int = _CALL_TEXT_MAX) -> str:
+    return text if len(text) <= n else text[:n - 1] + '…'
+
+
+def _short(value: Any) -> str:
+    """Compact repr for call traces: never dumps big structures (list[3], dict[5])."""
+    if value is None or isinstance(value, (bool, int, float, complex)):
+        return _clip(repr(value), 20)
+    if isinstance(value, str):
+        return _clip(repr(value), 20)
+    if isinstance(value, (list, tuple, dict, set, frozenset, deque)):
+        return f"{type(value).__name__}[{len(value)}]"
+    return type(value).__name__
+
+
+def _call_args(frame) -> str:
+    """'check(x=5, a=list[3], …)' from a frame at its 'call' event."""
+    code = frame.f_code
+    n = code.co_argcount + code.co_kwonlyargcount
+    names = list(code.co_varnames[:n])
+    if code.co_flags & 0x04:   # *args
+        names.append(code.co_varnames[n]); n += 1
+    if code.co_flags & 0x08:   # **kwargs
+        names.append(code.co_varnames[n])
+    loc = frame.f_locals
+    args = ", ".join(f"{a}={_short(loc[a])}" for a in names if a in loc)
+    return _clip(f"{code.co_name}({args})")
+
+
 def _is_trackable(name: str, value: Any) -> bool:
     if name.startswith('_') or name in {'__builtins__', '__doc__', '__name__'}:
         return False
@@ -401,6 +433,8 @@ class CodeInstrumentor:
         self._snap_out_len = 0                     # out_len of the last snapshot
         self._globals: Optional[Dict[str, Any]] = None
         self._stopped = False
+        self._calls = 0                            # user frames on the stack (module = 1)
+        self._call_text: Dict[int, str] = {}       # id(frame) → 'f(x=1)' captured at call time
 
         self.output: str = ""
         self.stderr_output: str = ""
@@ -412,27 +446,58 @@ class CodeInstrumentor:
     # ── sys.settrace hooks ────────────────────────────────────────────────────
 
     def _call_hook(self, frame, event, arg):
-        """Return line hook only for frames that belong to user code."""
-        if frame.f_code.co_filename == self._FILENAME:
-            if time.perf_counter() > self._deadline:
-                raise _Timeout()
+        """Global hook ('call' events): trace user frames, record function calls."""
+        if frame.f_code.co_filename != self._FILENAME:
+            return None
+        if time.perf_counter() > self._deadline:
+            raise _Timeout()
+        self._calls += 1
+        name = frame.f_code.co_name
+        if self._stopped or name.startswith('<'):    # module, <lambda>, <genexpr>
             return self._line_hook
-        return None
+        if len(self.tracker) >= self.max_snapshots - 1:
+            self.truncated = True
+            return self._line_hook
+        text = _call_args(frame)
+        self._call_text[id(frame)] = text
+        out_len = self._out_len()
+        # Output printed by the calling line belongs to that line, not to the call.
+        caller = frame.f_back
+        if out_len > self._snap_out_len and self._last_line and caller is not None \
+                and caller.f_code.co_filename == self._FILENAME:
+            self._record(caller, self._last_line, out_len, force=True, depth=self._depth() - 1)
+        self._last_line = frame.f_lineno
+        if len(self.tracker) < self.max_snapshots - 1:
+            self._record(frame, frame.f_lineno, out_len,
+                         call={'kind': 'call', 'name': name, 'text': text, 'ret': None})
+        return self._line_hook
+
+    def _depth(self) -> int:
+        """Stack level relative to user code: 0 = module, 1 = a function it called…"""
+        return max(0, self._calls - 1)
 
     def _line_hook(self, frame, event, arg):
         # 'line' fires BEFORE a line runs; 'return' lets us capture the effect
         # of the last line of a function / of the whole program.
         if event not in ('line', 'return'):
             return self._line_hook
-        if time.perf_counter() > self._deadline:
-            raise _Timeout()
-        if self._stopped:
-            return self._line_hook
+        try:
+            if time.perf_counter() > self._deadline:
+                raise _Timeout()
+            if not self._stopped:
+                self._on_line_or_return(frame, event, arg)
+        finally:
+            if event == 'return':
+                self._calls -= 1
+        return self._line_hook
 
+    def _on_line_or_return(self, frame, event, arg) -> None:
         lineno = frame.f_lineno
         prev_line = self._last_line      # the line that has just finished running
         self._last_line = lineno
         out_len = self._out_len()
+        name = frame.f_code.co_name
+        is_func_return = event == 'return' and not name.startswith('<')
 
         # One slot is always reserved for the final "Fin del programa" step.
         limit = self.max_snapshots - 1
@@ -442,15 +507,23 @@ class CodeInstrumentor:
             # The previous line printed something → step attributed to THAT line.
             if out_len > self._snap_out_len and prev_line:
                 self._record(frame, prev_line, out_len, force=True)
-            if len(self.tracker) < limit:
-                self._record(frame, lineno, out_len)
-            else:
+            if len(self.tracker) >= limit:
                 self.truncated = True
+            elif is_func_return:
+                # Always a step when a user function returns, with its result.
+                text = self._call_text.get(id(frame)) or _clip(f"{name}()")
+                ret = arg if isinstance(arg, bool) else None
+                self._record(frame, lineno, out_len, force=True, call={
+                    'kind': 'return', 'name': name, 'ret': ret,
+                    'text': _clip(f"{text} → {_short(arg)}", 2 * _CALL_TEXT_MAX)})
+            else:
+                self._record(frame, lineno, out_len)
 
-        # A finished function's locals no longer exist: stop showing them.
-        if event == 'return' and frame.f_code.co_name != '<module>':
-            self._release(id(frame))
-        return self._line_hook
+        if event == 'return':
+            self._call_text.pop(id(frame), None)
+            # A finished function's locals no longer exist: stop showing them.
+            if name != '<module>':
+                self._release(id(frame))
 
     def _out_len(self) -> int:
         return self._out.tell() if self._out is not None else 0
@@ -465,7 +538,8 @@ class CodeInstrumentor:
         if owned:
             self.tracker.unwatch(*owned)
 
-    def _record(self, frame, lineno: int, out_len: int, force: bool = False) -> None:
+    def _record(self, frame, lineno: int, out_len: int, force: bool = False,
+                call: Optional[Dict[str, Any]] = None, depth: Optional[int] = None) -> None:
         raw = {
             k: v for k, v in frame.f_locals.items()
             if _is_trackable(k, v)
@@ -503,7 +577,8 @@ class CodeInstrumentor:
         self.tracker.watch(**current)
         src = self._src(lineno)
         self.tracker.set_meta(line=lineno, source=src, __kinds__=dict(self._kinds),
-                              __sizes__=dict(self._sizes), out_len=out_len)
+                              __sizes__=dict(self._sizes), out_len=out_len,
+                              depth=self._depth() if depth is None else depth, call=call)
         snap = self.tracker.snapshot(f"L{lineno}: {src}")
         # Snapshot copies are never mutated: reuse them instead of copying again.
         self._prev = {k: snap.variables[k] for k in current}
@@ -536,7 +611,8 @@ class CodeInstrumentor:
         line = (error or {}).get('line') or self._last_line or None
         meta: Dict[str, Any] = dict(line=line, source=self._src(line), __kinds__=kinds,
                                     __sizes__=sizes,
-                                    out_len=len(output), final=True, error=bool(error))
+                                    out_len=len(output), final=True, error=bool(error),
+                                    depth=0, call=None)
         if error:
             meta['error_msg'] = f"{error['type']}: {error['msg']}"
         self.tracker.set_meta(**meta)
@@ -676,6 +752,8 @@ class CodeInstrumentor:
         self._out = None
         self._globals = None
         self._stopped = False
+        self._calls = 0
+        self._call_text = {}
         self.output = self.stderr_output = ""
         self.truncated = False
         self.error_info = None

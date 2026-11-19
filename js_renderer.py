@@ -43,6 +43,18 @@ def _make_safe(obj: Any) -> Any:
     return str(obj)
 
 
+def _meta_safe(obj: Any) -> Any:
+    """Like _make_safe, but None stays JSON null (metadata such as call/ret uses it
+    as 'absent'; variables keep showing Python's None as before)."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return {str(k): _meta_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_meta_safe(v) for v in obj]
+    return _make_safe(obj)
+
+
 def _utf16_offsets(text: str):
     """Map a Python (code-point) prefix length to a JS (UTF-16) prefix length."""
     if all(ord(c) <= 0xFFFF for c in text):
@@ -57,7 +69,7 @@ def _serialize(snapshots: List[Snapshot], output: str = "") -> str:
     to_js = _utf16_offsets(output)
     data = []
     for s in snapshots:
-        meta = {k: _make_safe(v) for k, v in s.metadata.items()
+        meta = {k: _meta_safe(v) for k, v in s.metadata.items()
                 if k not in ('line', 'source', 'out_len')}
         data.append({
             'step':       s.step,
@@ -161,6 +173,12 @@ body{background:#141414;color:#d4d4d4;font-family:'JetBrains Mono','Fira Code',m
 .cbtn{background:transparent;color:#888;border:none;cursor:pointer;font-size:20px;transition:color .15s;flex-shrink:0;padding:4px 8px;line-height:1}
 .cbtn:hover{color:#fff}
 #slider{flex:1;accent-color:#00ff88;cursor:pointer}
+.ctext{font-size:12px;font-family:inherit;border:1px solid #333;border-radius:4px;padding:4px 8px}
+.ctext:disabled{opacity:.3;cursor:default}
+#speed{background:#1a1a1a;color:#bbb;border:1px solid #333;border-radius:4px;font-family:inherit;font-size:11px;padding:3px 4px;flex-shrink:0;cursor:pointer}
+.calllist{font-size:11px;line-height:1.55;padding:2px 2px 0}
+.calllist .crow{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.calllist .ctrue{color:#00ff88}.calllist .cfalse{color:#f92672}.calllist .cneu{color:#bdbdbd}.calllist .copen{color:#ff8c00}.calllist .cnone{color:#555;font-style:italic}
 #counter{color:#555;font-size:12px;min-width:60px;text-align:right;flex-shrink:0}
 #btoggle{background:#00ff88;border:none;border-radius:4px;color:#0d0d0d;font-size:11px;font-family:inherit;font-weight:700;padding:4px 10px;cursor:pointer;flex-shrink:0;align-self:flex-end;margin-bottom:4px;transition:background .15s,transform .1s;letter-spacing:.5px}
 #btoggle:hover{background:#00cc6e}
@@ -186,11 +204,16 @@ body{background:#141414;color:#d4d4d4;font-family:'JetBrains Mono','Fira Code',m
   </div>
   <div id="outwrap"><span id="outlabel">Salida</span><pre id="outtext"></pre></div>
   <div id="ctrl">
-    <button class="cbtn" id="bprev">⏮</button>
-    <button class="cbtn" id="bplay">▶</button>
-    <button class="cbtn" id="bnext">⏭</button>
+    <button class="cbtn" id="bprev" title="Anterior (←)">⏮</button>
+    <button class="cbtn" id="bplay" title="Reproducir / pausar">▶</button>
+    <button class="cbtn" id="bnext" title="Siguiente (→)">⏭</button>
+    <button class="cbtn ctext" id="bover" title="Paso sobre: avanza sin entrar en las funciones que se llaman (Shift+→)">↷ sobre</button>
+    <button class="cbtn ctext" id="bout" title="Salir: avanza hasta volver de la función actual">⤴ salir</button>
     <input type="range" id="slider" min="0" value="0">
     <span id="counter">1 / 1</span>
+    <select id="speed" title="Velocidad de reproducción">
+      <option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="2">2x</option><option value="4">4x</option>
+    </select>
   </div>
 </div>
 <script>
@@ -778,7 +801,7 @@ function renderMeta(variables,metadata,prevVars){
   const me=document.getElementById('metaextra');
   me.innerHTML='';
   for(const[k,v]of Object.entries(metadata)){
-    if(k==='line'||k==='source'||k==='__kinds__'||k==='__sizes__'||k==='__indexvars__'||k==='__indexmap__'||k==='out_len'||k==='final'||k==='error'||k==='error_msg')continue;
+    if(k==='line'||k==='source'||k==='__kinds__'||k==='__sizes__'||k==='__indexvars__'||k==='__indexmap__'||k==='depth'||k==='call'||k==='out_len'||k==='final'||k==='error'||k==='error_msg')continue;
     const d=document.createElement('div');
     d.className='mr';
     const sv=JSON.stringify(v);
@@ -964,10 +987,39 @@ function renderRangeRows(div,info){
   div.scrollTop=div.scrollHeight;
 }
 
+// ── Function calls panel ──────────────────────────────────────────────────────
+const HAS_CALLS=DATA.some(s=>s.metadata.call);
+
+// Last completed calls (with their result) + calls still running at step idx.
+function callsInfo(idx){
+  const done=[],open=[];
+  for(let i=0;i<=idx;i++){
+    const c=DATA[i].metadata.call;
+    if(!c)continue;
+    const d=DATA[i].metadata.depth||0;
+    if(c.kind==='call'){open.push({text:c.text,depth:d});}
+    else{
+      while(open.length&&open[open.length-1].depth>=d)open.pop();
+      done.push(c);
+    }
+  }
+  return{done:done.slice(-6),open:open.slice(-2)};
+}
+
+function renderCalls(div,info){
+  let h='';
+  for(const c of info.done){
+    const cls=c.ret===true?'ctrue':c.ret===false?'cfalse':'cneu';
+    h+='<div class="crow '+cls+'">↩ '+esc(c.text)+'</div>';
+  }
+  for(const o of info.open)h+='<div class="crow copen">⋯ '+esc(o.text)+'</div>';
+  div.innerHTML=h||'<div class="crow cnone">(sin llamadas todavía)</div>';
+}
+
 // ── Viz panel ─────────────────────────────────────────────────────────────────
-const TH={graph:275,grid:195,bintree:240,range:88};
+const TH={graph:275,grid:195,bintree:240,range:88,calls:0};
 const SH={stack:200};
-const PRIMARY=new Set(['range','graph','grid','bintree']);
+const PRIMARY=new Set(['range','calls','graph','grid','bintree']);
 const rp=document.getElementById('right');
 
 function makeWrap(p,height){
@@ -992,8 +1044,9 @@ function renderVizVars(snap,panels){
     const primaries=panels.filter(p=>PRIMARY.has(p.type));
     const secondaries=panels.filter(p=>!PRIMARY.has(p.type));
     for(const p of primaries){
-      const w=makeWrap(p,TH[p.type]||275);
+      const w=makeWrap(p,TH[p.type]??275);
       if(p.type==='range'){const d=document.createElement('div');d.className='rgcasc';d.id='rgc';w.appendChild(d);}
+      if(p.type==='calls'){const d=document.createElement('div');d.className='calllist';d.id='callsl';w.appendChild(d);}
       rp.appendChild(w);
     }
     if(secondaries.length>0){
@@ -1024,6 +1077,7 @@ function renderVizVars(snap,panels){
       case'graph':renderGraph(svg,p.name,p.val,hl,p.weighted);break;
       case'bintree':renderBinTree(svg,p.name,p.val,hl);break;
       case'range':renderRange(svg,p.val);renderRangeRows(document.getElementById('rgc'),p.val);break;
+      case'calls':renderCalls(document.getElementById('callsl'),p.val);break;
     }
   }
 }
@@ -1221,6 +1275,10 @@ function renderBadge(s){
   b.classList.toggle('bfin',fin&&!err);
   b.classList.toggle('berr',err);
   if(fin)b.textContent='Fin del programa'+(err?' — ✖ '+(s.metadata.error_msg||'error'):'');
+  else if(s.metadata.call&&s.metadata.call.kind==='return')
+    b.textContent='Paso '+(s.step+1)+' ↩ '+s.metadata.call.text;
+  else if(s.metadata.call)
+    b.textContent='Paso '+(s.step+1)+' → llamada '+s.metadata.call.text;
   else b.textContent='Paso '+(s.step+1)+' → '+(s.metadata.source||'—');
 }
 
@@ -1233,6 +1291,7 @@ function renderStep(idx){
   }));
   const panels=buildPanels(s.variables,s.metadata.__kinds__||{},s.metadata.__sizes__);
   const rng=rangeInfo(idx);
+  if(HAS_CALLS)panels.unshift({name:'__calls',type:'calls',val:callsInfo(idx),title:'Llamadas'});
   if(rng)panels.unshift({name:'__range',type:'range',val:rng,
     title:'Rango de búsqueda · '+rng.cfg.lo+' / '+rng.cfg.hi+(rng.cfg.mid?' / '+rng.cfg.mid:'')});
   renderBadge(s);
@@ -1243,13 +1302,42 @@ function renderStep(idx){
   document.getElementById('slider').value=idx;
   document.getElementById('counter').textContent=(idx+1)+' / '+TOTAL;
   document.getElementById('bplay').textContent=playing?'⏸':'▶';
+  document.getElementById('bout').disabled=depthAt(idx)===0;
 }
 
+let speed=1;
 function stopPlay(){playing=false;clearInterval(timer);timer=null;document.getElementById('bplay').textContent='▶';}
 function startPlay(){
   playing=true;document.getElementById('bplay').textContent='⏸';
-  timer=setInterval(()=>{if(cur>=TOTAL-1)stopPlay();else renderStep(cur+1);},600);
+  clearInterval(timer);
+  timer=setInterval(()=>{if(cur>=TOTAL-1)stopPlay();else renderStep(cur+1);},600/speed);
 }
+
+// depth: stack level relative to user code (0 = module)
+function depthAt(i){return DATA[i].metadata.depth||0;}
+// Paso sobre: next step at the same level or above (skips called functions' bodies).
+function stepOver(){
+  stopPlay();
+  const d=depthAt(cur);let j=cur+1;
+  while(j<TOTAL-1&&depthAt(j)>d)j++;
+  renderStep(j);
+}
+// Salir: next step at a lower level (back in the caller).
+function stepOut(){
+  stopPlay();
+  const d=depthAt(cur);if(d===0)return;
+  let j=cur+1;
+  while(j<TOTAL-1&&depthAt(j)>=d)j++;
+  renderStep(j);
+}
+document.getElementById('bover').onclick=stepOver;
+document.getElementById('bout').onclick=stepOut;
+document.getElementById('speed').onchange=e=>{speed=parseFloat(e.target.value)||1;if(playing)startPlay();};
+document.addEventListener('keydown',e=>{
+  if(e.target&&e.target.tagName==='SELECT')return;
+  if(e.key==='ArrowRight'){e.preventDefault();if(e.shiftKey)stepOver();else{stopPlay();renderStep(cur+1);}}
+  else if(e.key==='ArrowLeft'){e.preventDefault();stopPlay();renderStep(cur-1);}
+});
 
 document.getElementById('bprev').onclick=()=>{stopPlay();renderStep(cur-1);};
 document.getElementById('bnext').onclick=()=>{stopPlay();renderStep(cur+1);};
