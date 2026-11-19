@@ -777,7 +777,7 @@ function renderMeta(variables,metadata,prevVars){
   const me=document.getElementById('metaextra');
   me.innerHTML='';
   for(const[k,v]of Object.entries(metadata)){
-    if(k==='line'||k==='source'||k==='__kinds__'||k==='__sizes__'||k==='out_len'||k==='final'||k==='error'||k==='error_msg')continue;
+    if(k==='line'||k==='source'||k==='__kinds__'||k==='__sizes__'||k==='__indexvars__'||k==='__indexmap__'||k==='out_len'||k==='final'||k==='error'||k==='error_msg')continue;
     const d=document.createElement('div');
     d.className='mr';
     const sv=JSON.stringify(v);
@@ -908,6 +908,20 @@ function injectPathHighlights(snap){
 // ── Automatic highlights (no AI): diffs, pointers, graph roles, grid cells ──
 const PTR_NAMES=['i','j','k','l','r','lo','hi','mid','left','right','idx','pos','p','start','end','cur'];
 const NODE_NAMES=['u','v','node','cur','curr','x','start','src'];
+// Fallback (no __indexvars__ from the instrumentor): old name list minus
+// names that usually hold values, not indices.
+const NOT_INDEX=new Set(['k','p','x','y','z','n','m']);
+
+// Names allowed to be drawn as pointers under the array/dict `panel`: those the
+// code really uses inside panel[...] (__indexmap__), else any name used as an
+// index (__indexvars__), else the old name list minus value-like names.
+function pointerNames(snap,panel,forDict){
+  const md=snap.metadata||{};
+  if(md.__indexmap__&&typeof md.__indexmap__==='object')return md.__indexmap__[panel]||[];
+  if(Array.isArray(md.__indexvars__))return md.__indexvars__;
+  const base=forDict?[...new Set([...PTR_NAMES,...NODE_NAMES])]:PTR_NAMES;
+  return base.filter(n=>!NOT_INDEX.has(n));
+}
 const VISITED_NAMES=['visited','seen','vis'];
 const FRONTIER_NAMES=['queue','q','stack','pq','frontier','heap'];
 const GRID_PAIRS=[['r','c','current'],['nr','nc','frontier'],['i','j','current'],
@@ -983,8 +997,8 @@ function autoHighlights(snap,prevSnap){
             if(i>=pp.val.length||!same(val[i],pp.val[i]))addHL(out,name,'updated',i);
         }
       }
-      // 2. index pointers
-      for(const p of PTR_NAMES){
+      // 2. index pointers (only names used as indices in the code)
+      for(const p of pointerNames(snap,name,false)){
         if(p in scal&&scal[p]>=0&&scal[p]<val.length){
           addHL(out,name,'current',scal[p]);addLabel(out,name,scal[p],p);
         }
@@ -995,7 +1009,7 @@ function autoHighlights(snap,prevSnap){
         for(const[k,v]of Object.entries(val))
           if(!(k in pp.val)||!same(v,pp.val[k]))addHL(out,name,'updated',k);
       }
-      for(const p of [...new Set([...PTR_NAMES,...NODE_NAMES])]){
+      for(const p of pointerNames(snap,name,true)){
         if(p in scal&&String(scal[p])in val){
           addHL(out,name,'current',String(scal[p]));addLabel(out,name,String(scal[p]),p);
         }

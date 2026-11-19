@@ -15,6 +15,7 @@ Safety model:
 from __future__ import annotations
 
 import __future__ as _future
+import ast
 import bisect as _bisect
 import builtins as _builtins
 import collections as _collections
@@ -297,6 +298,48 @@ def _kind(value: Any) -> Optional[str]:
     if isinstance(value, str):
         return 'str'
     return None
+
+
+def _index_vars(code: str) -> tuple:
+    """Which names are used as indices, globally and per container.
+
+    X[expr] makes the names that appear directly in `expr` pointers of X:
+    a[i], a[lo:hi], a[mid+1], dp[i-1][j] (dp ← i, j). A nested subscript counts
+    for its own container: dp[c - w[i]] gives dp ← c and w ← i, so `i` is not
+    drawn under dp. `k` in `need > k` is a value, never an index.
+    Returns (sorted global list, {container: sorted names}); ([], {}) if the
+    code doesn't parse.
+    """
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError):
+        return [], {}
+
+    def direct_names(expr):
+        found, stack = set(), [expr]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, ast.Subscript):
+                continue            # handled as its own container
+            if isinstance(node, ast.Name):
+                found.add(node.id)
+            stack.extend(ast.iter_child_nodes(node))
+        return found
+
+    def root_name(node):
+        while isinstance(node, ast.Subscript):
+            node = node.value
+        return node.id if isinstance(node, ast.Name) else None
+
+    per: Dict[str, set] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Subscript):
+            names = direct_names(node.slice)
+            container = root_name(node.value)
+            if container and names:
+                per.setdefault(container, set()).update(names)
+    all_names = sorted(set().union(*per.values())) if per else []
+    return all_names, {k: sorted(v) for k, v in per.items()}
 
 
 def _is_trackable(name: str, value: Any) -> bool:
@@ -643,6 +686,10 @@ class CodeInstrumentor:
         except SyntaxError as e:
             self.error_info = {'type': 'SyntaxError', 'msg': e.msg, 'line': e.lineno}
             return f"SyntaxError (línea {e.lineno}): {e.msg}"
+
+        # Global metadata (carried by every snapshot): which names act as indices.
+        index_vars, index_map = _index_vars(code)
+        self.tracker.set_meta(__indexvars__=index_vars, __indexmap__=index_map)
 
         # 1) Traced run → snapshots + program output (consistent with the trace).
         traced = self._exec_once(compiled, stdin_text, traced=True)
