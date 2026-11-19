@@ -147,6 +147,7 @@ body{background:#141414;color:#d4d4d4;font-family:'JetBrains Mono','Fira Code',m
 .vtitle{font-size:10px;color:#00ff88;margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px}
 .vsvg{display:block;width:100%;overflow:visible}
 .animfill{transition:fill .25s ease,stroke .25s ease}
+.rgcasc{max-height:168px;overflow-y:auto;margin-top:4px;border-top:1px solid #2d2d2d}
 .nodata{background:#1a1a1a;border-radius:6px;padding:20px;text-align:center;color:#444;font-size:11px;flex-shrink:0}
 #badge.bfin{color:#00ff88;font-weight:bold}
 #badge.berr{border-left-color:#f92672;color:#f92672;font-weight:bold}
@@ -833,10 +834,140 @@ function toggleCode(){
   renderStep(cur);   // panel width changed: re-layout the SVGs
 }
 
+// ── Search-range panel (binary search on the answer) ──────────────────────────
+// Shown when integer scalars form an interval (lo/hi, low/high, l/r, left/right,
+// with optional mid/m) and none of them is used as an index (__indexvars__):
+// if they index an array, the array already shows them as pointers.
+const RANGE_PAIRS=[['lo','hi'],['low','high'],['l','r'],['left','right']];
+const MID_NAMES=['mid','m'];
+const ANS_NAMES=['ans','res','result','best'];
+let RANGE_CFG;   // names chosen once for the whole trace (structure, not content)
+
+function rangeConfig(){
+  if(RANGE_CFG!==undefined)return RANGE_CFG;
+  RANGE_CFG=null;
+  const iv=new Set((DATA.length&&DATA[0].metadata.__indexvars__)||[]);
+  for(const[lo,hi]of RANGE_PAIRS){
+    if(!DATA.some(s=>isInt(s.variables[lo])&&isInt(s.variables[hi])))continue;
+    const mid=MID_NAMES.find(m=>DATA.some(s=>isInt(s.variables[m])&&isInt(s.variables[lo])))||null;
+    if(iv.has(lo)||iv.has(hi)||(mid&&iv.has(mid)))return RANGE_CFG;   // classic search over an array
+    RANGE_CFG={lo,hi,mid};
+    break;
+  }
+  return RANGE_CFG;
+}
+
+function rangeOut(name,val,mid,sign){
+  if(val===mid+sign)return name+'=mid'+(sign>0?'+1':'-1');
+  if(val===mid)return name+'=mid';
+  return name+'='+val;
+}
+
+// Everything is computed from steps 0..idx only: going back never shows the future.
+function rangeInfo(idx){
+  const c=rangeConfig();
+  if(!c)return null;
+  let L0=null,H0=null,pl,ph,pm=null,cur=null,ans=null;
+  const rows=[];
+  for(let i=0;i<=idx;i++){
+    const v=DATA[i].variables;
+    for(const a of ANS_NAMES){
+      if(a in v){const x=v[a];ans=(typeof x==='number'&&x!==-1)?x:null;break;}
+    }
+    const lo=v[c.lo],hi=v[c.hi];
+    if(!isInt(lo)||!isInt(hi))continue;
+    const mid=c.mid&&isInt(v[c.mid])?v[c.mid]:null;
+    if(L0===null){L0=lo;H0=hi;}
+    const moved=pl!==undefined&&(lo!==pl||hi!==ph);
+    const last=rows[rows.length-1];
+    if(c.mid){
+      // lo/hi moved after this iteration's mid → that is its outcome
+      if(moved&&last&&last.out===null&&last.mid!==null)
+        last.out=lo!==pl?rangeOut(c.lo,lo,last.mid,+1):rangeOut(c.hi,hi,last.mid,-1);
+      if(mid!==null&&mid!==pm)rows.push({lo,hi,mid,out:null});
+    }else if(pl===undefined||moved){
+      rows.push({lo,hi,mid:null,out:null});
+    }
+    pl=lo;ph=hi;pm=mid;cur={lo,hi,mid};
+  }
+  if(L0===null)return null;
+  return{cfg:c,L0,H0,cur,ans,rows};
+}
+
+function renderRange(svg,info){
+  const W=svg.clientWidth||600;
+  const pad=Math.min(80,Math.max(40,6*Math.max(String(info.L0).length,String(info.H0).length)+12)),tw=W-2*pad;
+  const{L0,H0,cur,ans,cfg}=info;
+  const span=(H0-L0)||1;
+  const X=v=>pad+Math.max(0,Math.min(1,(v-L0)/span))*tw;
+  const clampX=(x,half)=>Math.max(pad-30+half,Math.min(W-pad+30-half,x));
+  const T=(x,y,txt,fill,anchor,size,bold)=>'<text x="'+x+'" y="'+y+'" fill="'+fill+'" text-anchor="'+(anchor||'middle')+
+    '" font-size="'+(size||10)+'"'+(bold?' font-weight="bold"':'')+'>'+esc(txt)+'</text>';
+  let h='';
+  h+='<rect x="'+pad+'" y="44" width="'+tw+'" height="8" rx="3" fill="#2d2d2d"/>';
+  if(cur.lo<=cur.hi){
+    const x1=X(cur.lo),x2=X(cur.hi);
+    h+='<rect x="'+x1+'" y="42" width="'+Math.max(3,x2-x1)+'" height="12" rx="2" fill="#00ff88" opacity="0.35"/>';
+  }
+  // range ends outside the bar, so no marker can cover them
+  h+=T(pad-6,51,String(L0),'#555','end',9)+T(W-pad+6,51,String(H0),'#555','start',9);
+  // lo / hi markers (▼ pink); one combined label when they are too close
+  const xl=X(cur.lo),xh=X(cur.hi);
+  h+=T(xl,41,'▼','#f92672','middle',11)+T(xh,41,'▼','#f92672','middle',11);
+  const ll=cfg.lo+'='+cur.lo,hl=cfg.hi+'='+cur.hi;
+  if(Math.abs(xh-xl)<(ll.length+hl.length)*6+12){
+    const t='['+ll+', '+hl+']';
+    h+=T(clampX((xl+xh)/2,t.length*3.2),28,t,'#f92672','middle',10,true);
+  }else{
+    h+=T(clampX(xl,ll.length*3.2),28,ll,'#f92672','middle',10,true)+T(clampX(xh,hl.length*3.2),28,hl,'#f92672','middle',10,true);
+  }
+  // mid (◆ orange) with its value above
+  if(cur.mid!==null){
+    const xm=X(cur.mid),ml=cfg.mid+'='+cur.mid;
+    h+=T(xm,52,'◆','#ff8c00','middle',12)+T(clampX(xm,ml.length*3.2),12,ml,'#ff8c00','middle',10,true);
+  }
+  // ans flag (yellow) under the line
+  if(ans!==null){
+    const xa=X(ans);
+    h+='<line x1="'+xa+'" y1="52" x2="'+xa+'" y2="84" stroke="#e6db74" stroke-width="1.5"/>';
+    h+='<polygon points="'+xa+',72 '+(xa+10)+',76 '+xa+',80" fill="#e6db74"/>';
+    const al='ans='+ans;
+    h+=T(xa>W-pad-60?xa-4:xa+13,83,al,'#e6db74',xa>W-pad-60?'end':'start',10,true);
+  }
+  svg.innerHTML=h;
+}
+
+function renderRangeRows(div,info){
+  const W=div.clientWidth||600;
+  const MAXR=30,RH=16;
+  const all=info.rows;
+  const rows=all.slice(-MAXR),first=all.length-rows.length;
+  const tx0=34,tx1=Math.max(tx0+60,W-200),tw=tx1-tx0;
+  const span=(info.H0-info.L0)||1;
+  const X=v=>tx0+Math.max(0,Math.min(1,(v-info.L0)/span))*tw;
+  let h='';
+  rows.forEach((r,k)=>{
+    const y=k*RH+2,isCur=k===rows.length-1;
+    if(isCur)h+='<rect x="0" y="'+(y-1)+'" width="'+W+'" height="'+RH+'" rx="3" fill="#262626" stroke="#00ff88" stroke-opacity="0.6"/>';
+    h+='<text x="4" y="'+(y+11)+'" font-size="9" fill="'+(isCur?'#00ff88':'#555')+'">#'+(first+k+1)+'</text>';
+    h+='<rect x="'+tx0+'" y="'+(y+4)+'" width="'+tw+'" height="6" rx="2" fill="#2d2d2d"/>';
+    if(r.lo<=r.hi){
+      const x1=X(r.lo),x2=X(r.hi);
+      h+='<rect x="'+x1+'" y="'+(y+3)+'" width="'+Math.max(3,x2-x1)+'" height="8" rx="1" fill="#00ff88" opacity="'+(isCur?0.7:0.35)+'"/>';
+    }
+    if(r.mid!==null)h+='<rect x="'+(X(r.mid)-1)+'" y="'+(y+1)+'" width="3" height="12" fill="#ff8c00"/>';
+    const label=(r.mid!==null?info.cfg.mid+'='+r.mid:info.cfg.lo+'='+r.lo+', '+info.cfg.hi+'='+r.hi);
+    h+='<text x="'+(tx1+8)+'" y="'+(y+11)+'" font-size="10" fill="'+(isCur?'#d4d4d4':'#999')+'">'+esc(label)+
+       (r.out?'<tspan fill="#e6db74"> → '+esc(r.out)+'</tspan>':'')+'</text>';
+  });
+  div.innerHTML='<svg width="'+W+'" height="'+(rows.length*RH+4)+'" style="display:block">'+h+'</svg>';
+  div.scrollTop=div.scrollHeight;
+}
+
 // ── Viz panel ─────────────────────────────────────────────────────────────────
-const TH={graph:275,grid:195,bintree:240};
+const TH={graph:275,grid:195,bintree:240,range:88};
 const SH={stack:200};
-const PRIMARY=new Set(['graph','grid','bintree']);
+const PRIMARY=new Set(['range','graph','grid','bintree']);
 const rp=document.getElementById('right');
 
 function makeWrap(p,height){
@@ -860,7 +991,11 @@ function renderVizVars(snap,panels){
     rp.dataset.varkey=varKey;
     const primaries=panels.filter(p=>PRIMARY.has(p.type));
     const secondaries=panels.filter(p=>!PRIMARY.has(p.type));
-    for(const p of primaries)rp.appendChild(makeWrap(p,TH[p.type]||275));
+    for(const p of primaries){
+      const w=makeWrap(p,TH[p.type]||275);
+      if(p.type==='range'){const d=document.createElement('div');d.className='rgcasc';d.id='rgc';w.appendChild(d);}
+      rp.appendChild(w);
+    }
     if(secondaries.length>0){
       const grid=document.createElement('div');
       grid.id='secondary-grid';
@@ -888,6 +1023,7 @@ function renderVizVars(snap,panels){
       case'grid':renderGrid(svg,p.name,p.val,hl);break;
       case'graph':renderGraph(svg,p.name,p.val,hl,p.weighted);break;
       case'bintree':renderBinTree(svg,p.name,p.val,hl);break;
+      case'range':renderRange(svg,p.val);renderRangeRows(document.getElementById('rgc'),p.val);break;
     }
   }
 }
@@ -1096,6 +1232,9 @@ function renderStep(idx){
     highlights:mergeHL(base.highlights,autoHighlights(base,prevSnap)),
   }));
   const panels=buildPanels(s.variables,s.metadata.__kinds__||{},s.metadata.__sizes__);
+  const rng=rangeInfo(idx);
+  if(rng)panels.unshift({name:'__range',type:'range',val:rng,
+    title:'Rango de búsqueda · '+rng.cfg.lo+' / '+rng.cfg.hi+(rng.cfg.mid?' / '+rng.cfg.mid:'')});
   renderBadge(s);
   renderOutput(idx,s);
   highlightLine(s.metadata.line||0,HOTSPOTS);
